@@ -21,6 +21,7 @@ CONTAINER_NAME="filebrowser"
 PORT="${PORT:-8080}"                          # 手机访问用的端口
 DATA_DIR="$HOME/.filebrowser"
 DB_PATH="$DATA_DIR/filebrowser.db"
+SETTINGS_PATH="$DATA_DIR/settings.json"
 IMAGE="filebrowser/filebrowser:latest"
 CONF_FILE="$DATA_DIR/install.conf"
 
@@ -45,6 +46,37 @@ if [ -n "${SHARE_DIR:-}" ]; then
 fi
 if ((${#FB_SHARES[@]} == 0)); then
   FB_SHARES=("$HOME/Videos")
+fi
+
+# 加载即校验：密码不足 12 位时当场重新设置并回写配置，
+# 不等到写数据库才报错（兼容旧版安装脚本生成的配置）
+if [ "$CONFIG_LOADED" -eq 1 ] && [ ${#FB_PASS} -lt 12 ]; then
+  echo "!! 配置中的密码不足 12 位（File Browser 硬性要求），请重新设置："
+  while true; do
+    read -rs -p "请输入新密码（至少 12 位，输入时不显示）：" new_pass
+    echo ""
+    if [ ${#new_pass} -lt 12 ]; then
+      echo "!! 不足 12 位，请重新输入"
+      continue
+    fi
+    read -rs -p "请再次输入密码确认：" new_pass2
+    echo ""
+    if [ "$new_pass" = "$new_pass2" ]; then
+      FB_PASS="$new_pass"
+      break
+    fi
+    echo "!! 两次输入不一致，请重新输入"
+  done
+  # 回写配置文件，一次修正永久生效
+  {
+    printf 'FB_USER=%q\n' "$FB_USER"
+    printf 'FB_PASS=%q\n' "$FB_PASS"
+    echo "FB_SHARES=("
+    for s in "${FB_SHARES[@]}"; do printf '  %q\n' "$s"; done
+    echo ")"
+  } > "$CONF_FILE"
+  chmod 600 "$CONF_FILE"
+  echo "==> 新密码已保存到 $CONF_FILE"
 fi
 
 # ---------- 停止全部 Docker 实例（含 File Browser） ----------
@@ -181,6 +213,20 @@ if [ -d "$DB_PATH" ]; then
 fi
 touch "$DB_PATH"
 
+# 源头防线②-b：自写 settings.json 并挂载进容器，强制数据库路径为 /database.db。
+# 新版镜像默认用 /config/settings.json（指向匿名卷里的 /database/filebrowser.db），
+# 不固定的话服务器会无视我们挂载的数据库文件，导致账号配置全部落空。
+cat > "$SETTINGS_PATH" <<'EOF'
+{
+  "port": 80,
+  "baseURL": "",
+  "address": "",
+  "log": "stdout",
+  "database": "/database.db",
+  "root": "/srv"
+}
+EOF
+
 # 源头防线②：数据目录属主必须是当前用户（防止曾用 sudo 运行导致 root 占用）
 if [ "$(stat -c %U "$DATA_DIR")" != "$USER" ]; then
   echo "==> 修正数据目录属主 ..."
@@ -190,10 +236,17 @@ fi
 # 清理可能残留的同名旧容器
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
-# 组装共享目录挂载：每个目录映射到 /srv/目录名，重名自动加序号
+# 组装共享目录挂载：每个目录映射到 /srv/目录名
+# 完全重复的路径直接跳过；不同路径但重名的自动加序号
 MOUNT_ARGS=()
 declare -A USED_NAMES=()
+declare -A USED_SRC=()
 for d in "${FB_SHARES[@]}"; do
+  if [ -n "${USED_SRC[$d]:-}" ]; then
+    echo "    跳过重复路径：$d"
+    continue
+  fi
+  USED_SRC[$d]=1
   base="$(basename "$d")"
   name="$base"; n=2
   while [ -n "${USED_NAMES[$name]:-}" ]; do
@@ -203,45 +256,63 @@ for d in "${FB_SHARES[@]}"; do
   MOUNT_ARGS+=(-v "$d:/srv/$name")
 done
 
+# 源头防线③：数据库初始化与账号配置必须在【服务器启动前】用一次性容器完成。
+# 原因：File Browser 的 Bolt 数据库是独占锁，服务器运行时任何 CLI 操作都会
+#       timeout 失败——所以顺序是：先初始化/配置 → 再启动服务。
+fb_cli() {
+  docker run --rm -v "$DB_PATH":/database.db "$IMAGE" -d /database.db "$@"
+}
+
+if [ ! -s "$DB_PATH" ]; then
+  echo "==> 初始化账号数据库 ..."
+  fb_cli config init >/dev/null
+fi
+
+if [ "$CONFIG_LOADED" -eq 1 ]; then
+  echo "==> 应用登录账号配置（用户：$FB_USER）"
+  if ! fb_cli users add "$FB_USER" "$FB_PASS" --perm.admin >/dev/null 2>&1; then
+    # 用户已存在则更新密码
+    if ! fb_cli users update "$FB_USER" --password "$FB_PASS" >/dev/null 2>&1; then
+      echo "!! 账号配置失败，File Browser 原始报错如下："
+      fb_cli users add "$FB_USER" "$FB_PASS" --perm.admin || true
+      echo ""
+      echo "   常见原因：密码少于 12 位（硬性要求）。"
+      echo "   解决：nano ~/.filebrowser/install.conf 修改 FB_PASS 后重新运行本脚本。"
+      exit 1
+    fi
+  fi
+  # 使用自定义账号后移除默认 admin，避免弱口令入口
+  if [ "$FB_USER" != "admin" ]; then
+    fb_cli users rm admin >/dev/null 2>&1 || true
+  fi
+fi
+
 docker run -d \
   --name "$CONTAINER_NAME" \
   --restart no \
   -p "${PORT}:80" \
   "${MOUNT_ARGS[@]}" \
   -v "$DB_PATH":/database.db \
+  -v "$SETTINGS_PATH":/config/settings.json:ro \
   -e TZ=Asia/Shanghai \
   "$IMAGE" >/dev/null
 
-# 源头防线③：启动后验证账号库初始化成功（最多重试 5 次，每次间隔 1 秒）
-echo "==> 验证账号数据库初始化 ..."
-db_ok=0
-for _ in 1 2 3 4 5; do
-  if docker exec "$CONTAINER_NAME" filebrowser users ls -d /database.db >/dev/null 2>&1; then
-    db_ok=1
+# 源头防线④：启动后通过 HTTP 健康检查验证服务真正可用（不碰数据库锁）
+echo "==> 验证服务可用性 ..."
+svc_ok=0
+for _ in $(seq 1 10); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/health" 2>/dev/null || true)"
+  if [ "$code" = "200" ]; then
+    svc_ok=1
     break
   fi
   sleep 1
 done
-if [ "$db_ok" -ne 1 ]; then
-  echo "!! 账号数据库初始化失败，登录将不可用。"
-  echo "   已自动清理异常容器，请直接重新运行本脚本；"
+if [ "$svc_ok" -ne 1 ]; then
+  echo "!! 服务未通过健康检查。请执行 docker logs $CONTAINER_NAME 查看原因；"
   echo "   反复失败请执行 filebrowser清理重装.sh 后重装。"
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   exit 1
-fi
-
-# 应用安装阶段设置的登录账号（每次启动强制同步，账号密码以 install.conf 为准）
-if [ "$CONFIG_LOADED" -eq 1 ]; then
-  echo "==> 应用登录账号配置（用户：$FB_USER）"
-  if [ "$FB_USER" = "admin" ]; then
-    docker exec "$CONTAINER_NAME" filebrowser users update admin --password "$FB_PASS" -d /database.db >/dev/null
-  else
-    if ! docker exec "$CONTAINER_NAME" filebrowser users add "$FB_USER" "$FB_PASS" -d /database.db >/dev/null 2>&1; then
-      docker exec "$CONTAINER_NAME" filebrowser users update "$FB_USER" --password "$FB_PASS" -d /database.db >/dev/null
-    fi
-    # 使用自定义账号后移除默认 admin，避免弱口令入口
-    docker exec "$CONTAINER_NAME" filebrowser users rm admin -d /database.db >/dev/null 2>&1 || true
-  fi
 fi
 
 # ---------- 3. 显示访问地址并进入常驻操作菜单 ----------

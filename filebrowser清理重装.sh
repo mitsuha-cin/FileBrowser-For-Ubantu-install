@@ -27,7 +27,7 @@ echo "   · 所有 Docker 容器、镜像、数据卷（含 jellyfin / immich �
 echo "   · /var/lib/docker、/var/lib/containerd 全部数据"
 echo "   · 所有 Docker 相关软件包（自动检测）"
 echo "   · Docker APT 仓库配置与密钥"
-echo "   · File Browser 配置（~/.filebrowser，密码会重置）"
+echo "   · File Browser 账号数据库与配置（~/.filebrowser，含 filebrowser.db，密码会重置）"
 echo ""
 echo " 不会删除：~/Videos 里的视频文件"
 echo "============================================================"
@@ -83,6 +83,11 @@ sudo rm -f  /var/run/docker.sock /var/run/docker.pid
 sudo rm -f  /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker.sources
 sudo rm -f  /etc/apt/keyrings/docker.asc /etc/apt/keyrings/docker.gpg
 sudo rm -f  /usr/share/keyrings/docker-archive-keyring.gpg
+
+# File Browser 账号数据库与配置（含异常状态遗留的库文件，重装后从零初始化）
+echo "    删除 File Browser 账号数据库：~/.filebrowser/filebrowser.db"
+rm -f "$HOME/.filebrowser/filebrowser.db"
+echo "    删除 File Browser 全部配置：~/.filebrowser（含 install.conf）"
 rm -rf "$HOME/.filebrowser" "$HOME/.docker"
 sudo groupdel docker >/dev/null 2>&1 || true
 

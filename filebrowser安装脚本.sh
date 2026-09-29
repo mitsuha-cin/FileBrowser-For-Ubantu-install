@@ -67,10 +67,10 @@ while [ -z "$FB_USER" ]; do
 done
 
 while true; do
-  read -rs -p "请输入密码（不可为空，输入时不显示）：" FB_PASS
+  read -rs -p "请输入密码（至少 12 位，输入时不显示）：" FB_PASS
   echo ""
-  if [ -z "$FB_PASS" ]; then
-    echo "!! 密码不能为空，请重新输入"
+  if [ ${#FB_PASS} -lt 12 ]; then
+    echo "!! 密码不足 12 位（File Browser 的硬性要求），请重新输入"
     continue
   fi
   read -rs -p "请再次输入密码确认：" FB_PASS2
@@ -127,8 +127,21 @@ echo "============================================================"
 echo " 安装完成！配置已保存到 ~/.filebrowser/install.conf"
 echo ""
 echo " 登录账号： $FB_USER（密码为你刚才设置的）"
-echo " 共享目录："
-for s in "${FB_SHARES[@]}"; do echo "   · $s"; done
+echo ""
+echo " 共享目录（左边 = 手机端看到的文件夹名，右边 = 实际路径）："
+declare -A SEEN_NAMES=()
+for s in "${FB_SHARES[@]}"; do
+  base="$(basename "$s")"; name="$base"; n=2
+  while [ -n "${SEEN_NAMES[$name]:-}" ]; do name="${base}_${n}"; n=$((n + 1)); done
+  SEEN_NAMES[$name]=1
+  echo "   · $name  ←  $s"
+done
+echo ""
+echo " 想共享 DATA 盘里的某个文件夹，路径要写到那一级，例如："
+echo "   /run/media/cince/DATA/UU精选  → 手机端显示 UU精选"
+echo "   只写 /run/media/cince/DATA   → 手机端显示 DATA（整盘共享）"
+echo ""
+echo " 之后想改：nano ~/.filebrowser/install.conf，重启启动脚本即生效。"
 echo ""
 echo " 注意：docker 组权限需要新会话才能生效（26.04 默认无 newgrp 命令）。"
 echo " 请执行： su - \$USER   （输入登录密码，当前终端立即生效）"
