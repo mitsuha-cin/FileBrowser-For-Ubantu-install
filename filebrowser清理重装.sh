@@ -59,6 +59,8 @@ fi
 echo ""
 echo "==> [2/6] 停止所有容器与 Docker 服务 ..."
 if command -v docker >/dev/null 2>&1; then
+  # 显式清理本项目的两个容器
+  docker rm -f filebrowser filebrowser-webdav >/dev/null 2>&1 || true
   docker stop $(docker ps -aq 2>/dev/null) >/dev/null 2>&1 || true
 fi
 sudo systemctl stop docker.service docker.socket containerd.service >/dev/null 2>&1 || true

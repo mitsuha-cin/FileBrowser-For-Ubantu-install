@@ -18,11 +18,14 @@ set -euo pipefail
 
 # ---------- 可配置项 ----------
 CONTAINER_NAME="filebrowser"
-PORT="${PORT:-8080}"                          # 手机访问用的端口
+PORT="${PORT:-8080}"                          # File Browser 网页端口
+WEBDAV_CONTAINER="filebrowser-webdav"         # WebDAV 容器（手机第三方播放器用）
+WEBDAV_PORT="${WEBDAV_PORT:-8081}"            # WebDAV 端口
 DATA_DIR="$HOME/.filebrowser"
 DB_PATH="$DATA_DIR/filebrowser.db"
 SETTINGS_PATH="$DATA_DIR/settings.json"
 IMAGE="filebrowser/filebrowser:latest"
+DAV_IMAGE="sigoden/dufs:latest"               # 轻量 WebDAV 服务镜像
 CONF_FILE="$DATA_DIR/install.conf"
 
 # 读取安装阶段保存的配置（登录账号 / 共享目录列表）
@@ -89,15 +92,15 @@ shutdown_all() {
     # shellcheck disable=SC2086
     docker stop $ids >/dev/null 2>&1 || true
   fi
-  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  echo "==> 已全部关闭（含 File Browser）。"
+  docker rm -f "$CONTAINER_NAME" "$WEBDAV_CONTAINER" >/dev/null 2>&1 || true
+  echo "==> 已全部关闭（含 File Browser 与 WebDAV）。"
 }
 
-# ---------- 仅退出 File Browser ----------
+# ---------- 仅退出 File Browser（含配套的 WebDAV 容器） ----------
 shutdown_self() {
   trap - EXIT INT TERM HUP   # 主动退出，摘掉信号陷阱防止二次触发
-  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  echo "==> 仅退出 File Browser，其他 Docker 实例保持运行。"
+  docker rm -f "$CONTAINER_NAME" "$WEBDAV_CONTAINER" >/dev/null 2>&1 || true
+  echo "==> 仅退出 File Browser（含 WebDAV），其他 Docker 实例保持运行。"
 }
 
 # ---------- 清理函数（仅在信号触发时执行，无轮询、无定时器） ----------
@@ -106,13 +109,13 @@ cleanup() {
   echo ""
   echo "==> 正在退出 File Browser ..."
 
-  # 查询除 filebrowser 外仍在运行的 Docker 实例
+  # 查询除 filebrowser / webdav 外仍在运行的 Docker 实例
   local others=()
-  mapfile -t others < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -vx "$CONTAINER_NAME" || true)
+  mapfile -t others < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -vx "$CONTAINER_NAME" | grep -vx "$WEBDAV_CONTAINER" || true)
 
   # 没有其他实例 → 直接静默清理
   if ((${#others[@]} == 0)); then
-    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    docker rm -f "$CONTAINER_NAME" "$WEBDAV_CONTAINER" >/dev/null 2>&1 || true
     echo "==> 清理完成，File Browser 已关闭。"
     exit 0
   fi
@@ -239,6 +242,8 @@ docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 # 组装共享目录挂载：每个目录映射到 /srv/目录名
 # 完全重复的路径直接跳过；不同路径但重名的自动加序号
 MOUNT_ARGS=()
+SHARE_NAMES=()        # 有效路径对应的显示名（WebDAV 容器复用，保证两边一致）
+EFFECTIVE_PATHS=()    # 去重后的实际路径，与 SHARE_NAMES 一一对应
 declare -A USED_NAMES=()
 declare -A USED_SRC=()
 for d in "${FB_SHARES[@]}"; do
@@ -253,6 +258,8 @@ for d in "${FB_SHARES[@]}"; do
     name="${base}_${n}"; n=$((n + 1))
   done
   USED_NAMES[$name]=1
+  SHARE_NAMES+=("$name")
+  EFFECTIVE_PATHS+=("$d")
   MOUNT_ARGS+=(-v "$d:/srv/$name")
 done
 
@@ -315,14 +322,54 @@ if [ "$svc_ok" -ne 1 ]; then
   exit 1
 fi
 
+# ---------- 2b. 启动 WebDAV 服务（手机第三方播放器专用通道） ----------
+echo "==> 启动 WebDAV 服务（端口：$WEBDAV_PORT，供 VLC / nPlayer 等播放器使用）"
+
+if ! docker image inspect "$DAV_IMAGE" >/dev/null 2>&1; then
+  echo "==> 首次运行，拉取镜像 $DAV_IMAGE"
+  docker pull "$DAV_IMAGE"
+fi
+
+# 与 File Browser 使用完全相同的显示名，挂载到 /data/ 下
+DAV_MOUNT_ARGS=()
+for i in "${!SHARE_NAMES[@]}"; do
+  DAV_MOUNT_ARGS+=(-v "${EFFECTIVE_PATHS[$i]}:/data/${SHARE_NAMES[$i]}")
+done
+
+docker rm -f "$WEBDAV_CONTAINER" >/dev/null 2>&1 || true
+
+docker run -d \
+  --name "$WEBDAV_CONTAINER" \
+  --restart no \
+  -p "${WEBDAV_PORT}:5000" \
+  "${DAV_MOUNT_ARGS[@]}" \
+  -e TZ=Asia/Shanghai \
+  "$DAV_IMAGE" -A -a "${FB_USER}:${FB_PASS}@/:rw" /data >/dev/null
+
+# 健康检查（返回 401 表示服务正常且要求认证）
+dav_ok=0
+for _ in $(seq 1 5); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${WEBDAV_PORT}/" 2>/dev/null || true)"
+  if [ "$code" = "200" ] || [ "$code" = "401" ]; then
+    dav_ok=1
+    break
+  fi
+  sleep 1
+done
+if [ "$dav_ok" -ne 1 ]; then
+  echo "!! WebDAV 服务未就绪（不影响 File Browser 使用）"
+  echo "   排查：docker logs $WEBDAV_CONTAINER"
+fi
+
 # ---------- 3. 显示访问地址并进入常驻操作菜单 ----------
 LAN_IP="$(hostname -I | awk '{print $1}')"
 
 print_menu() {
   echo ""
   echo "============================================================"
-  echo " 手机 / 电脑浏览器访问：  http://${LAN_IP}:${PORT}"
-  echo " 登录账号： $FB_USER（密码为安装时设置的）"
+  echo " 网页浏览（File Browser）：http://${LAN_IP}:${PORT}"
+  echo " 播放器专用（WebDAV）：    http://${LAN_IP}:${WEBDAV_PORT}"
+  echo " 登录账号： $FB_USER（两个入口共用同一账号密码）"
   echo ""
   echo " 共享目录："
   local d
@@ -333,7 +380,7 @@ print_menu() {
   echo ""
   echo " 操作选项（按对应按键即可，无需回车）："
   echo ""
-  echo "   q  = 仅退出 File Browser（其他 Docker 服务保持运行）"
+  echo "   q  = 仅退出 File Browser 和 WebDAV（其他 Docker 服务保持运行）"
   echo "   a  = 关闭全部（会先列出当前运行的 Docker 实例，二次确认）"
   echo ""
   echo " 也可以按 Ctrl+C 或直接点 X 关窗，均会弹出二次确认。"

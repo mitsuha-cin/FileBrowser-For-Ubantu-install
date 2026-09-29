@@ -51,6 +51,9 @@ sudo usermod -aG docker "$USER"
 echo "==> 拉取 File Browser 镜像"
 sudo docker pull filebrowser/filebrowser:latest
 
+echo "==> 拉取 WebDAV 镜像（dufs，供手机第三方播放器使用）"
+sudo docker pull sigoden/dufs:latest
+
 # 创建数据目录与数据库文件
 mkdir -p "$HOME/Videos" "$HOME/.filebrowser"
 touch "$HOME/.filebrowser/filebrowser.db"

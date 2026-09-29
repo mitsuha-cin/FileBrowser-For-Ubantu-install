@@ -18,8 +18,9 @@ sudo systemctl disable docker.service docker.socket containerd.service >/dev/nul
 echo "==> [2/3] 将当前用户加入 docker 组（免 sudo 使用 docker）"
 sudo usermod -aG docker "$USER"
 
-echo "==> [3/3] 拉取 File Browser 镜像"
+echo "==> [3/3] 拉取 File Browser 与 WebDAV 镜像"
 sudo docker pull filebrowser/filebrowser:latest
+sudo docker pull sigoden/dufs:latest
 
 # 创建数据目录与数据库文件
 mkdir -p "$HOME/Videos" "$HOME/.filebrowser"
